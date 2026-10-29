@@ -1,0 +1,81 @@
+name: Build
+
+on:
+  push:
+  workflow_dispatch:
+
+jobs:
+  android:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/setup-java@v4
+        with:
+          distribution: temurin
+          java-version: '17'
+
+      - name: Build APK (aapt2 + javac + d8)
+        run: |
+          set -e
+          SDK="${ANDROID_HOME:-$ANDROID_SDK_ROOT}"
+          BT=$(ls -d "$SDK"/build-tools/* | sort -V | tail -1)
+          PLAT=$(ls -d "$SDK"/platforms/android-* | sort -V | tail -1)
+          echo "build-tools: $BT"
+          echo "platform:    $PLAT"
+
+          mkdir -p build/classes build/dex out
+          "$BT/aapt2" link -o build/base.apk \
+            --manifest android/AndroidManifest.xml \
+            -I "$PLAT/android.jar" \
+            --min-sdk-version 14 --target-sdk-version 15
+
+          javac --release 8 -Xlint:-options -cp "$PLAT/android.jar" -d build/classes \
+            $(find android/src -name '*.java')
+
+          "$BT/d8" --min-api 14 --lib "$PLAT/android.jar" --output build/dex \
+            $(find build/classes -name '*.class')
+
+          cp build/base.apk build/unaligned.apk
+          (cd build/dex && zip -j ../unaligned.apk classes.dex)
+          "$BT/zipalign" -f -p 4 build/unaligned.apk build/aligned.apk
+
+          keytool -genkeypair -keystore build/debug.jks -alias key -keyalg RSA -keysize 2048 \
+            -validity 10000 -storepass android -keypass android -dname "CN=TabMonitor"
+          "$BT/apksigner" sign --ks build/debug.jks --ks-pass pass:android --key-pass pass:android \
+            --min-sdk-version 14 --out out/TabMonitor.apk build/aligned.apk
+          "$BT/apksigner" verify -v out/TabMonitor.apk | head -5
+
+      - uses: actions/upload-artifact@v4
+        with:
+          name: TabMonitor-Tablet-APK
+          path: out/TabMonitor.apk
+
+  windows:
+    runs-on: windows-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Build exe
+        run: dotnet build windows/TabMonitor.csproj -c Release -o dist
+
+      - name: Add adb (for USB-debugging cable mode)
+        shell: pwsh
+        run: |
+          Invoke-WebRequest https://dl.google.com/android/repository/platform-tools-latest-windows.zip -OutFile pt.zip
+          Expand-Archive pt.zip -DestinationPath pt
+          Copy-Item pt/platform-tools/adb.exe dist/
+          Copy-Item pt/platform-tools/AdbWinApi.dll dist/
+          Copy-Item pt/platform-tools/AdbWinUsbApi.dll dist/
+          Get-ChildItem dist
+
+      - uses: actions/upload-artifact@v4
+        with:
+          name: TabMonitor-PC
+          path: |
+            dist/TabMonitor.exe
+            dist/TabMonitor.exe.config
+            dist/adb.exe
+            dist/AdbWinApi.dll
+            dist/AdbWinUsbApi.dll
+          if-no-files-found: error
